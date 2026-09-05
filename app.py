@@ -324,6 +324,36 @@ def history(symbol: str) -> pd.DataFrame:
     return hist
 
 
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def market_intelligence(symbol: str) -> tuple[list[dict[str, str]], dict[str, float]]:
+    """Recent public news and analyst-price metadata when Yahoo Finance covers the ticker."""
+    if yf is None:
+        return [], {}
+    ticker = yf.Ticker(symbol)
+    news_items: list[dict[str, str]] = []
+    try:
+        for item in (ticker.news or [])[:5]:
+            content = item.get("content", item)
+            title = content.get("title", item.get("title", ""))
+            url = (content.get("canonicalUrl", {}) or {}).get("url", item.get("link", ""))
+            publisher = content.get("provider", {}).get("displayName", item.get("publisher", ""))
+            if title and url:
+                news_items.append({"title": str(title), "url": str(url), "publisher": str(publisher)})
+    except Exception:
+        pass
+    targets: dict[str, float] = {}
+    try:
+        raw = ticker.analyst_price_targets
+        if isinstance(raw, dict):
+            for source, target in raw.items():
+                value = _number(target)
+                if pd.notna(value) and value > 0:
+                    targets[str(source)] = value
+    except Exception:
+        pass
+    return news_items, targets
+
+
 def indicators(hist: pd.DataFrame) -> pd.DataFrame:
     out = hist.copy()
     close = out.close
@@ -331,6 +361,10 @@ def indicators(hist: pd.DataFrame) -> pd.DataFrame:
     out["ma60"] = close.rolling(60).mean()
     out["bb_upper"] = out["ma20"] + 2 * close.rolling(20).std()
     out["bb_lower"] = out["ma20"] - 2 * close.rolling(20).std()
+    above_ma = 10 * (close - out["ma20"]) / (out["bb_upper"] - out["ma20"])
+    below_ma = 10 * (close - out["ma20"]) / (out["ma20"] - out["bb_lower"])
+    out["bb_position"] = np.where(close >= out["ma20"], above_ma, below_ma)
+    out["bb_position"] = pd.Series(out["bb_position"], index=out.index).clip(-10, 10)
     delta = close.diff()
     gain, loss = delta.clip(lower=0).rolling(14).mean(), -delta.clip(upper=0).rolling(14).mean()
     out["rsi14"] = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
@@ -363,7 +397,8 @@ def batch_technical_signals(symbols: tuple[str, ...]) -> pd.DataFrame:
             if strong or pullback:
                 rows.append({"symbol": symbol, "setup": "連續強勢（月線上）" if strong else "強勢後拉回月線附近",
                              "close": last.close, "ma20": last.ma20, "ma60": last.ma60,
-                             "distance_to_ma20": (last.close / last.ma20 - 1) * 100, "ma20_slope_5d": ma20_slope})
+                             "distance_to_ma20": (last.close / last.ma20 - 1) * 100, "ma20_slope_5d": ma20_slope,
+                             "bb_position": last.bb_position})
         except (KeyError, IndexError):
             continue
     return pd.DataFrame(rows)
@@ -501,17 +536,35 @@ def add_analysis_link(frame: pd.DataFrame, code_column: str) -> pd.DataFrame:
     return result
 
 
+def comma_format(frame: pd.DataFrame) -> pd.io.formats.style.Styler:
+    """Apply consistent, readable thousand separators to every numeric table field."""
+    formats = {}
+    for column in frame.select_dtypes(include="number").columns:
+        label = str(column)
+        formats[column] = "{:,.2f}" if any(token in label for token in ("價", "%", "分數", "斜率", "距月", "億")) else "{:,.0f}"
+    return frame.style.format(formats, na_rep="—")
+
+
 LINK_CONFIG = {"個股分析": st.column_config.LinkColumn("個股分析", display_text="🔎 開啟分析")}
 
 if page == "每日主流族群":
     ranked = theme_ranking(market)
+    st.subheader("量化結果：10 檔研究關注清單")
+    st.caption("依流動性、當日動能、族群熱度與最新法人買賣超排序；僅供建立研究清單，並非買進建議。")
+    try:
+        watchlist = watchlist_recommendations(market).assign(成交額_億元=lambda x: x.value / 100_000_000).rename(
+            columns={"code": "代號", "name": "名稱", "theme": "中文族群", "close": "最近成交價", "return_pct": "漲跌幅(%)", "quant_score": "量化分數"})
+        watchlist = add_analysis_link(watchlist, "代號")
+        st.dataframe(comma_format(watchlist[["代號", "名稱", "中文族群", "最近成交價", "漲跌幅(%)", "個股期", "認購權證", "認售權證", "關注原因", "量化分數", "個股分析"]]), column_config=LINK_CONFIG, hide_index=True, use_container_width=True)
+    except requests.RequestException:
+        st.info("法人資料暫時無法取得，請稍後重新整理。")
     st.subheader("主流族群熱度")
     st.caption("資料為 API 最近一次發布的完整收盤快照；非盤中資料。篩選：單檔成交額至少 3,000 萬元、族群至少 2 檔。")
     display = ranked.head(10).copy()
     display["成交額（億元）"] = display.value / 100_000_000
     display["上漲家數比"] = display.advancers * 100
     display = display.rename(columns={"theme": "族群", "stocks": "樣本數", "avg_return": "平均漲幅(%)", "theme_score": "熱度分數"})
-    st.dataframe(display[["族群", "樣本數", "成交額（億元）", "平均漲幅(%)", "上漲家數比", "熱度分數"]].round(2), hide_index=True, use_container_width=True)
+    st.dataframe(comma_format(display[["族群", "樣本數", "成交額（億元）", "平均漲幅(%)", "上漲家數比", "熱度分數"]]), hide_index=True, use_container_width=True)
     if not ranked.empty:
         st.caption("點開下列族群即可檢視該族群個股與衍生商品標記。")
         for row in ranked.head(10).itertuples():
@@ -519,20 +572,10 @@ if page == "每日主流族群":
                 leaders = market[market.theme == row.theme].sort_values(["return_pct", "value"], ascending=False)
                 leaders = leaders.assign(成交額_億元=leaders.value / 100_000_000).rename(columns={"code":"代號", "name":"名稱", "market":"市場", "close":"收盤", "return_pct":"漲幅(%)"})
                 leaders = add_analysis_link(leaders, "代號")
-                st.dataframe(leaders[["代號", "名稱", "市場", "收盤", "漲幅(%)", "成交額_億元", "個股期", "認購權證", "認售權證", "個股分析"]].round(2), column_config=LINK_CONFIG, hide_index=True, use_container_width=True)
-    st.subheader("量化結果：10 檔研究關注清單")
-    st.caption("依流動性、當日動能、族群熱度與最新法人買賣超排序；僅供建立研究清單，並非買進建議。")
-    try:
-        watchlist = watchlist_recommendations(market).assign(成交額_億元=lambda x: x.value / 100_000_000).rename(
-            columns={"code": "代號", "name": "名稱", "theme": "中文族群", "close": "最近成交價", "return_pct": "漲跌幅(%)", "quant_score": "量化分數"})
-        watchlist = add_analysis_link(watchlist, "代號")
-        st.dataframe(watchlist[["代號", "名稱", "中文族群", "最近成交價", "漲跌幅(%)", "個股期", "認購權證", "認售權證", "關注原因", "量化分數", "個股分析"]].round(2), column_config=LINK_CONFIG, hide_index=True, use_container_width=True)
-    except requests.RequestException:
-        st.info("法人資料暫時無法取得，請稍後重新整理。")
-
+                st.dataframe(comma_format(leaders[["代號", "名稱", "市場", "收盤", "漲幅(%)", "成交額_億元", "個股期", "認購權證", "認售權證", "個股分析"]]), column_config=LINK_CONFIG, hide_index=True, use_container_width=True)
 if page == "法人／月線選股":
-    st.subheader("投信連買＋主力價量＋月線型態")
-    st.caption("條件：上市股投信連續 3 個交易日買超；月線（20 日）斜率為正，且為月線上方強勢或強勢後拉回月線 ±3%。")
+    st.subheader("投信連買＋月線型態")
+    st.caption("條件：上市股投信連續 3 個交易日買超；月線（20 日）斜率為正，且為月線上方強勢或強勢後拉回月線 ±3%。主力分點條件將於 CMoney 資料接入後加入。")
     scan_limit = st.slider("技術型態掃描檔數（依成交額與漲幅排序）", min_value=20, max_value=100, value=50, step=10)
     if st.button("執行法人／月線選股", type="primary"):
         with st.spinner("正在取得近三日投信資料與月線型態…"):
@@ -546,9 +589,10 @@ if page == "法人／月線選股":
             ).rename(columns={"code": "代號", "name": "名稱", "theme": "中文族群", "setup": "技術型態",
                                "distance_to_ma20": "距月線(%)", "candidate_score": "候選分數"})
             table = table.rename(columns={"ma20_slope_5d": "月線5日斜率(%)"})
+            table = table.rename(columns={"bb_position": "布林位階"})
             table = table.rename(columns={"close": "最近成交價", "return_pct": "漲跌幅(%)"})
             table = add_analysis_link(table, "代號")
-            st.dataframe(table[["代號", "名稱", "中文族群", "最近成交價", "漲跌幅(%)", "個股期", "認購權證", "認售權證", "技術型態", "成交額_億元", "投信三日買超_張", "月線5日斜率(%)", "距月線(%)", "候選分數", "個股分析"]].round(2), column_config=LINK_CONFIG, hide_index=True, use_container_width=True)
+            st.dataframe(comma_format(table[["代號", "名稱", "中文族群", "最近成交價", "漲跌幅(%)", "個股期", "認購權證", "認售權證", "技術型態", "布林位階", "成交額_億元", "投信三日買超_張", "月線5日斜率(%)", "距月線(%)", "候選分數", "個股分析"]]), column_config=LINK_CONFIG, hide_index=True, use_container_width=True)
 
 if page == "個股三面向":
     query = st.text_input("股票代號或名稱", value=requested_stock, placeholder="例如：2330 或 台積電")
@@ -578,12 +622,19 @@ if page == "個股三面向":
             call_badge = "🟠 有認購權證" if name in call_warrant_underlyings else "⚪ 無認購權證"
             put_badge = "🟣 有認售權證" if name in put_warrant_underlyings else "⚪ 無認售權證"
             st.markdown(f"**最近成交價：{current.close:.2f}｜漲跌幅：{current.return_pct:.2f}%｜{futures_badge}｜{call_badge}｜{put_badge}**")
-            a, b, c, d = st.columns(4)
+            a, b, c, d, e = st.columns(5)
             a.metric("收盤價", f"{last.close:.2f}")
             b.metric("基本面", f"{fund}/100")
             c.metric("技術面", f"{tech}/100")
             d.metric("籌碼面", f"{chip}/100")
+            e.metric("布林位階", f"{last.bb_position:.1f}", help="月線為 0；布林上軌為 +10；布林下軌為 -10。超出通道時固定為 ±10。")
             st.info(f"綜合研究分數：**{total}/100 — {score_label(total)}**。請以停損、部位上限與事件風險控管為先。")
+            if pd.notna(last.bb_position):
+                position_note = "接近上軌，偏強／留意過熱" if last.bb_position >= 7 else "接近下軌，偏弱／留意反彈確認" if last.bb_position <= -7 else "位於通道中段"
+                st.markdown(f"### 布林位階：{last.bb_position:.1f}　{position_note}")
+                st.caption("定義：月線＝0、布林上軌＝+10、布林下軌＝-10；超出通道固定為 ±10。")
+            else:
+                st.caption("布林位階需要至少 20 個交易日的收盤資料。")
             fig = go.Figure()
             fig.add_trace(go.Candlestick(x=hist.index, open=hist.open, high=hist.high, low=hist.low, close=hist.close, name="股價"))
             fig.add_trace(go.Scatter(x=hist.index, y=hist.ma20, name="MA20"))
@@ -592,11 +643,31 @@ if page == "個股三面向":
             fig.add_trace(go.Scatter(x=hist.index, y=hist.bb_lower, name="布林下軌", line=dict(color="#ff9f43", dash="dot"), fill="tonexty", fillcolor="rgba(255,159,67,0.08)"))
             fig.update_layout(height=450, xaxis_rangeslider_visible=False, margin=dict(l=10, r=10, t=30, b=10))
             st.plotly_chart(fig, use_container_width=True)
+            st.markdown("**近期消息與市場預估**")
+            news_items, targets = market_intelligence(symbol)
+            if targets:
+                low = targets.get("low", targets.get("lowTarget"))
+                mean = targets.get("mean", targets.get("meanTarget"))
+                high = targets.get("high", targets.get("highTarget"))
+                target_parts = []
+                if low: target_parts.append(f"低：{low:,.2f}")
+                if mean: target_parts.append(f"平均：{mean:,.2f}")
+                if high: target_parts.append(f"高：{high:,.2f}")
+                st.info("券商／分析師目標價（資料供應商彙整）：" + "｜".join(target_parts))
+            else:
+                st.caption("券商／分析師目標價：目前資料供應商未提供此股票的可用預估資料。")
+            if news_items:
+                for item in news_items:
+                    source = f"（{item['publisher']}）" if item["publisher"] else ""
+                    st.markdown(f"- [{item['title']}]({item['url']}) {source}")
+            else:
+                st.caption("近期新聞：目前資料供應商未提供可用項目。")
             left, right = st.columns(2)
             with left:
                 st.markdown("**基本面與技術面**")
                 st.write("・" + "\n・".join(fund_notes + tech_notes))
                 st.caption(f"PE：{val_row.pe if pd.notna(val_row.pe) else '—'}｜殖利率：{val_row['yield'] if pd.notna(val_row['yield']) else '—'}%｜PB：{val_row.pb if pd.notna(val_row.pb) else '—'}")
+                st.caption(f"布林位階：{last.bb_position:.1f}（月線＝0｜上軌＝+10｜下軌＝-10）" if pd.notna(last.bb_position) else "布林位階：資料不足")
             with right:
                 st.markdown("**籌碼面**")
                 st.write("・" + "\n・".join(chip_notes))
@@ -609,7 +680,7 @@ if page == "個股三面向":
                 if institution_history.empty:
                     st.info("暫時無法取得法人歷史明細。")
                 else:
-                    st.dataframe(institution_history, hide_index=True, use_container_width=True)
+                    st.dataframe(comma_format(institution_history), hide_index=True, use_container_width=True)
             else:
                 st.info("上櫃近 10 日法人明細需逐日 TPEx 分點／法人歷史資料介接；目前先顯示最新日籌碼資料。")
         except Exception as exc:
