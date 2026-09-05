@@ -510,6 +510,35 @@ def score_label(score: float) -> str:
     return "偏多研究訊號" if score >= 65 else "中性觀察" if score >= 45 else "偏弱／風險優先"
 
 
+def run_technical_backtest(hist: pd.DataFrame, max_hold: int = 20) -> tuple[pd.DataFrame, dict[str, float]]:
+    """Next-session-execution backtest; avoids using same-close signals as executable prices."""
+    data = indicators(hist).dropna().copy()
+    data["ma20_slope"] = data.ma20.pct_change(5)
+    data["entry"] = (data.close > data.ma20) & (data.ma20 > data.ma60) & (data.ma20_slope > 0) & data.bb_position.between(-2, 6)
+    trades, in_trade = [], False
+    for i in range(len(data) - 1):
+        row, next_row = data.iloc[i], data.iloc[i + 1]
+        if not in_trade and row.entry:
+            entry_date, entry_price, held, in_trade = data.index[i + 1], next_row.open, 0, True
+        elif in_trade:
+            held += 1
+            exit_signal = row.close < row.ma20 or row.bb_position >= 9 or held >= max_hold
+            if exit_signal:
+                exit_price = next_row.open
+                # buy commission 0.1425%; sell commission + 0.3% stock tax
+                net_return = (exit_price * (1 - .001425 - .003) / (entry_price * (1 + .001425)) - 1) * 100
+                trades.append({"進場日": entry_date.date(), "出場日": data.index[i + 1].date(), "進場價": entry_price,
+                               "出場價": exit_price, "持有日": held, "淨報酬(%)": net_return})
+                in_trade = False
+    trade_df = pd.DataFrame(trades)
+    if trade_df.empty:
+        return trade_df, {"trades": 0, "total_return": 0, "win_rate": 0, "max_drawdown": 0}
+    equity = (1 + trade_df["淨報酬(%)"] / 100).cumprod()
+    drawdown = equity / equity.cummax() - 1
+    return trade_df, {"trades": len(trade_df), "total_return": (equity.iloc[-1] - 1) * 100,
+                      "win_rate": (trade_df["淨報酬(%)"] > 0).mean() * 100, "max_drawdown": drawdown.min() * 100}
+
+
 st.set_page_config(page_title="路易的台股量化研究室", page_icon="📈", layout="wide")
 st.title("路易的台股量化研究室")
 st.caption("以前一可得交易日收盤資料掃描市場；研究訊號不構成投資或股期交易建議。")
@@ -526,7 +555,7 @@ market["認售權證"] = market.name.astype(str).isin(put_warrant_underlyings).m
 
 requested_stock = st.query_params.get("stock", "")
 requested_page = st.query_params.get("page", "每日主流族群")
-pages = ["每日主流族群", "法人／月線選股", "個股三面向", "模型說明與風險"]
+pages = ["每日主流族群", "法人／月線選股", "個股三面向", "策略回測", "模型說明與風險"]
 page = st.radio("功能頁面", pages, index=pages.index(requested_page) if requested_page in pages else 0, horizontal=True, label_visibility="collapsed")
 
 
@@ -646,14 +675,15 @@ if page == "個股三面向":
             st.markdown("**近期消息與市場預估**")
             news_items, targets = market_intelligence(symbol)
             if targets:
-                low = targets.get("low", targets.get("lowTarget"))
-                mean = targets.get("mean", targets.get("meanTarget"))
-                high = targets.get("high", targets.get("highTarget"))
-                target_parts = []
-                if low: target_parts.append(f"低：{low:,.2f}")
-                if mean: target_parts.append(f"平均：{mean:,.2f}")
-                if high: target_parts.append(f"高：{high:,.2f}")
-                st.info("券商／分析師目標價（資料供應商彙整）：" + "｜".join(target_parts))
+                label_map = {"low": "低目標價", "lowTarget": "低目標價", "median": "中位目標價", "medianTarget": "中位目標價",
+                             "mean": "平均目標價", "meanTarget": "平均目標價", "high": "高目標價", "highTarget": "高目標價"}
+                target_rows = [{"提供單位": "Yahoo Finance 分析師彙整", "目標類型": label_map.get(key, key), "目標價": value}
+                               for key, value in targets.items() if key in label_map]
+                if target_rows:
+                    target_table = pd.DataFrame(target_rows).sort_values("目標價")
+                    st.dataframe(comma_format(target_table), hide_index=True, use_container_width=True)
+                else:
+                    st.caption("券商／分析師目標價：公開資料未提供可列示的目標價區間。")
             else:
                 st.caption("券商／分析師目標價：目前資料供應商未提供此股票的可用預估資料。")
             if news_items:
@@ -683,6 +713,59 @@ if page == "個股三面向":
                     st.dataframe(comma_format(institution_history), hide_index=True, use_container_width=True)
             else:
                 st.info("上櫃近 10 日法人明細需逐日 TPEx 分點／法人歷史資料介接；目前先顯示最新日籌碼資料。")
+        except Exception as exc:
+            st.warning(str(exc))
+
+if page == "策略回測":
+    mode = st.radio("回測模式", ["主動式：指定個股", "被動式：日期選股"], horizontal=True)
+    if mode == "主動式：指定個股":
+        st.subheader("主動式績效追蹤")
+        st.caption("以指定進場日後第一個可交易日收盤價為基準，列出各持有期間未扣成本與扣除台股買賣成本後的績效。")
+        backtest_query = st.text_input("股票代號或名稱", placeholder="例如：2330 或 台積電", key="backtest_stock")
+        capital = st.number_input("投入資金（元）", min_value=1_000, value=100_000, step=10_000)
+        entry_date = st.date_input("進場日期", value=date.today() - timedelta(days=90), max_value=date.today())
+        if backtest_query:
+            try:
+                _, backtest_name, backtest_symbol = resolve_symbol(backtest_query, market)
+                prices = history(backtest_symbol)
+                usable = prices[prices.index.date >= entry_date]
+                if usable.empty:
+                    st.warning("此日期後沒有可用交易資料。")
+                else:
+                    entry = usable.iloc[0]
+                    rows = []
+                    for label, sessions in [("1日", 1), ("5日", 5), ("20日", 20), ("60日", 60), ("至今", len(usable) - 1)]:
+                        if sessions >= len(usable): continue
+                        exit_price = usable.iloc[sessions].close
+                        gross = (exit_price / entry.close - 1) * 100
+                        net = (exit_price * (1 - .001425 - .003) / (entry.close * (1 + .001425)) - 1) * 100
+                        rows.append({"持有期間": label, "進場日": usable.index[0].date(), "進場價": entry.close, "出場日": usable.index[sessions].date(), "出場價": exit_price, "未扣成本(%)": gross, "扣成本淨報酬(%)": net, "期末金額": capital * (1 + net / 100)})
+                    st.markdown(f"**{backtest_query}｜{backtest_name}**")
+                    st.dataframe(comma_format(pd.DataFrame(rows)), hide_index=True, use_container_width=True)
+            except Exception as exc:
+                st.warning(str(exc))
+    else:
+        st.subheader("被動式：歷史日期條件選股")
+        passive_date = st.date_input("選股日期", value=date.today() - timedelta(days=1), max_value=date.today(), key="passive_date")
+        st.caption("條件：月線向上、股價月線上方、布林位階 -2 至 +6；投信連買與主力分點條件會於歷史資料庫完成後納入。")
+        st.info(f"已選擇 {passive_date:%Y-%m-%d}。目前專案僅保存最新全市場快照；要正確重建這一天的全市場候選股，需從每日收盤起持續保存全市場行情與法人資料。完成資料累積後，此區會列出候選股，並可點選檢視 1／5／20／60 日後續績效。")
+    # Legacy single-stock trade simulation retained below for technical validation.
+    if False and backtest_query:
+        try:
+            _, backtest_name, backtest_symbol = resolve_symbol(backtest_query, market)
+            backtest_hist = history(backtest_symbol)
+            trades, stats = run_technical_backtest(backtest_hist)
+            st.markdown(f"**{backtest_query}｜{backtest_name}（近一年）**")
+            a, b, c, d = st.columns(4)
+            a.metric("交易次數", f"{stats['trades']:,.0f}")
+            b.metric("累積淨報酬", f"{stats['total_return']:,.2f}%")
+            c.metric("勝率", f"{stats['win_rate']:,.1f}%")
+            d.metric("最大回撤", f"{stats['max_drawdown']:,.2f}%")
+            if trades.empty:
+                st.info("此區間沒有符合條件的完整交易。")
+            else:
+                st.dataframe(comma_format(trades), hide_index=True, use_container_width=True)
+            st.caption("本 Beta 版僅回測可完整取得歷史資料的技術條件；投信連買與 CMoney 分點主力資料接入後，會加入正式多因子回測。")
         except Exception as exc:
             st.warning(str(exc))
 
