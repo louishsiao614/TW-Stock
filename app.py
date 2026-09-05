@@ -309,7 +309,8 @@ def resolve_symbol(query: str, universe: pd.DataFrame) -> tuple[str, str, str]:
         raise ValueError("找不到此股票代號或名稱，請輸入上市／上櫃普通股代號或名稱。")
     item = hit.sort_values("value", ascending=False).iloc[0]
     suffix = ".TW" if item.market == "上市" else ".TWO"
-    return str(item.code), str(item.name), str(item.code) + suffix
+    # ``Series.name`` is the row index; use the named column explicitly.
+    return str(item["code"]), str(item["name"]), str(item["code"]) + suffix
 
 
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
@@ -474,8 +475,8 @@ def score_label(score: float) -> str:
     return "偏多研究訊號" if score >= 65 else "中性觀察" if score >= 45 else "偏弱／風險優先"
 
 
-st.set_page_config(page_title="台股量化研究室", page_icon="📈", layout="wide")
-st.title("台股量化研究室")
+st.set_page_config(page_title="路易的台股量化研究室", page_icon="📈", layout="wide")
+st.title("路易的台股量化研究室")
 st.caption("以前一可得交易日收盤資料掃描市場；研究訊號不構成投資或股期交易建議。")
 
 try:
@@ -554,6 +555,7 @@ if page == "個股三面向":
     if query:
         try:
             code, name, symbol = resolve_symbol(query, market)
+            st.success(f"搜尋結果：{code}｜{name}")
             hist = indicators(history(symbol))
             last = hist.iloc[-1]
             vals = valuation()
